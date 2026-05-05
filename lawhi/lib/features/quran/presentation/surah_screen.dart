@@ -7,6 +7,13 @@ import 'package:lawhi/core/theme/app_theme.dart';
 
 final _selectedReciterProvider = StateProvider<String>((ref) => 'ar.alafasy');
 
+// Precomputed cumulative verse counts — avoids O(n²) in _globalAyah
+final List<int> _cumulative = () {
+  final r = [0];
+  for (int s = 1; s <= 114; s++) r.add(r.last + quran.getVerseCount(s));
+  return r;
+}();
+
 class SurahScreen extends ConsumerStatefulWidget {
   final int surahId;
   const SurahScreen({super.key, required this.surahId});
@@ -35,25 +42,9 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
 
     _player.currentIndexStream.listen((idx) {
       if (!mounted || idx == null || idx >= _indexMap.length) return;
-      final (surah, verse) = _indexMap[idx];
-      if (surah != _displaySurah) {
-        // New surah — refresh the list and scroll to top
-        setState(() {
-          _displaySurah = surah;
-          _displayVerse = verse;
-          _verseKeys.clear();
-        });
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients) {
-            _scrollController.animateTo(0,
-                duration: const Duration(milliseconds: 400),
-                curve: Curves.easeOut);
-          }
-        });
-      } else {
-        setState(() => _displayVerse = verse);
-        _scrollToVerse(verse);
-      }
+      final (_, verse) = _indexMap[idx];
+      setState(() => _displayVerse = verse);
+      _scrollToVerse(verse);
     });
 
     _player.playingStream.listen((p) {
@@ -61,8 +52,24 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     });
 
     _player.processingStateStream.listen((s) {
-      if (mounted && s == ProcessingState.completed) {
-        setState(() => _isPlaying = false);
+      if (!mounted) return;
+      if (s == ProcessingState.completed) {
+        if (_displaySurah < 114) {
+          final nextSurah = _displaySurah + 1;
+          setState(() {
+            _displaySurah = nextSurah;
+            _displayVerse = 1;
+            _verseKeys.clear();
+          });
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_scrollController.hasClients) {
+              _scrollController.jumpTo(0);
+            }
+          });
+          _loadAndPlay(fromSurah: nextSurah);
+        } else {
+          setState(() => _isPlaying = false);
+        }
       }
     });
 
@@ -78,44 +85,43 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
 
   // ─── build full-Quran playlist from starting surah ───
 
-  int _globalAyah(int surah, int verse) {
-    int n = 0;
-    for (int s = 1; s < surah; s++) n += quran.getVerseCount(s);
-    return n + verse;
-  }
+  int _globalAyah(int surah, int verse) => _cumulative[surah - 1] + verse;
 
   Future<void> _loadAndPlay({int? fromSurah}) async {
-    final start = fromSurah ?? widget.surahId;
+    final surahToPlay = fromSurah ?? widget.surahId;
+    if (surahToPlay > 114) return;
     final reciter = ref.read(_selectedReciterProvider);
     setState(() => _isLoading = true);
 
     _indexMap.clear();
     final sources = <AudioSource>[];
+    final count = quran.getVerseCount(surahToPlay);
 
-    for (int s = start; s <= 114; s++) {
-      final count = quran.getVerseCount(s);
-      for (int v = 1; v <= count; v++) {
-        _indexMap.add((s, v));
-        sources.add(AudioSource.uri(
-          Uri.parse(
-              '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(s, v)}.mp3'),
-        ));
-      }
+    for (int v = 1; v <= count; v++) {
+      _indexMap.add((surahToPlay, v));
+      sources.add(AudioSource.uri(
+        Uri.parse(
+            '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(surahToPlay, v)}.mp3'),
+      ));
     }
 
     try {
       await _player.setAudioSource(
-        ConcatenatingAudioSource(children: sources),
+        ConcatenatingAudioSource(
+          useLazyPreparation: true,
+          children: sources,
+        ),
         initialIndex: 0,
         initialPosition: Duration.zero,
       );
       setState(() {
         _isLoading = false;
-        _displaySurah = start;
+        _displaySurah = surahToPlay;
         _displayVerse = 1;
       });
       await _player.play();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Audio error: $e');
       setState(() => _isLoading = false);
     }
   }
@@ -151,11 +157,16 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
 
   // Jump to a specific surah from the index list
   Future<void> _jumpToSurah(int surahId) async {
-    final idx = _indexMap.indexWhere((e) => e.$1 == surahId);
-    if (idx >= 0) {
-      await _player.seek(Duration.zero, index: idx);
-      if (!_isPlaying) await _player.play();
-    }
+    await _player.stop();
+    setState(() {
+      _displaySurah = surahId;
+      _displayVerse = 1;
+      _verseKeys.clear();
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) _scrollController.jumpTo(0);
+    });
+    await _loadAndPlay(fromSurah: surahId);
   }
 
   // Jump to a specific verse in current surah
