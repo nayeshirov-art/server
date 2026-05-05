@@ -147,6 +147,9 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     final reciter = ref.read(_selectedReciterProvider);
     setState(() => _isLoading = true);
 
+    final info = AppConstants.recitersMap[reciter];
+    if (info == null) return;
+
     _indexMap.clear();
     final sources = <AudioSource>[];
     final count = quran.getVerseCount(surahToPlay);
@@ -154,7 +157,7 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     for (int v = 1; v <= count; v++) {
       _indexMap.add((surahToPlay, v));
       sources.add(AudioSource.uri(Uri.parse(
-        '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(surahToPlay, v)}.mp3',
+        info.url(_globalAyah(surahToPlay, v), surahToPlay, v),
       )));
     }
 
@@ -303,7 +306,7 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
               });
               await _loadAndPlay();
             },
-            itemBuilder: (_) => AppConstants.reciters.entries
+            itemBuilder: (_) => AppConstants.recitersMap.entries
                 .map((e) => PopupMenuItem(
                       value: e.key,
                       child: Row(children: [
@@ -318,12 +321,12 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
                             crossAxisAlignment: CrossAxisAlignment.end,
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Text(e.value,
+                              Text(e.value.arabic,
                                   style: const TextStyle(
                                       fontFamily: 'Amiri', fontSize: 15),
                                   textDirection: TextDirection.rtl),
                               Text(
-                                AppConstants.recitersFr[e.key] ?? '',
+                                e.value.french,
                                 style: TextStyle(
                                     fontSize: 11,
                                     color: Colors.white.withValues(alpha: 0.5)),
@@ -358,12 +361,12 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
                     crossAxisAlignment: CrossAxisAlignment.end,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(AppConstants.reciters[reciter] ?? '',
+                      Text(AppConstants.recitersMap[reciter]?.arabic ?? '',
                           style: const TextStyle(
                               fontFamily: 'Amiri',
                               fontSize: 13,
                               color: AppTheme.gold)),
-                      Text(AppConstants.recitersFr[reciter] ?? '',
+                      Text(AppConstants.recitersMap[reciter]?.french ?? '',
                           style: TextStyle(
                               fontSize: 10,
                               color: Colors.white.withValues(alpha: 0.45))),
