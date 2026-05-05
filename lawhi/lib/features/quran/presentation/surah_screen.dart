@@ -9,6 +9,13 @@ import 'package:lawhi/core/theme/app_theme.dart';
 final _selectedReciterProvider = StateProvider<String>((ref) => 'ar.alafasy');
 
 
+// Precomputed cumulative verse counts — O(1) global ayah lookup
+final List<int> _cumulative = () {
+  final r = [0];
+  for (int s = 1; s <= 114; s++) r.add(r.last + quran.getVerseCount(s));
+  return r;
+}();
+
 // ─── Item types for the continuous Quran list ───────────────────────
 abstract class _Item { const _Item(); }
 
@@ -132,6 +139,8 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
   }
 
   // ─── Audio ───────────────────────────────────────────────────────
+  int _globalAyah(int surah, int verse) => _cumulative[surah - 1] + verse;
+
   Future<void> _loadAndPlay({int? fromSurah}) async {
     final surahToPlay = fromSurah ?? widget.surahId;
     if (surahToPlay > 114) return;
@@ -141,13 +150,11 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     _indexMap.clear();
     final sources = <AudioSource>[];
     final count = quran.getVerseCount(surahToPlay);
-    final s3 = surahToPlay.toString().padLeft(3, '0');
 
     for (int v = 1; v <= count; v++) {
       _indexMap.add((surahToPlay, v));
-      final v3 = v.toString().padLeft(3, '0');
       sources.add(AudioSource.uri(Uri.parse(
-        '${AppConstants.audioBaseUrl}/$reciter/$s3$v3.mp3',
+        '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(surahToPlay, v)}.mp3',
       )));
     }
 
