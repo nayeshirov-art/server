@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart';
@@ -7,13 +8,33 @@ import 'package:lawhi/core/theme/app_theme.dart';
 
 final _selectedReciterProvider = StateProvider<String>((ref) => 'ar.alafasy');
 
-// Precomputed cumulative verse counts — avoids O(n²) in _globalAyah
+// Precomputed cumulative verse counts — O(1) globalAyah lookup
 final List<int> _cumulative = () {
   final r = [0];
   for (int s = 1; s <= 114; s++) r.add(r.last + quran.getVerseCount(s));
   return r;
 }();
 
+// ─── Item types for the continuous Quran list ───────────────────────
+abstract class _Item { const _Item(); }
+
+class _SurahHeaderItem extends _Item {
+  final int surahId;
+  const _SurahHeaderItem(this.surahId);
+}
+
+class _JuzItem extends _Item {
+  final int juzNum;
+  const _JuzItem(this.juzNum);
+}
+
+class _VerseItem extends _Item {
+  final int surahId;
+  final int verse;
+  const _VerseItem(this.surahId, this.verse);
+}
+
+// ─── Screen ─────────────────────────────────────────────────────────
 class SurahScreen extends ConsumerStatefulWidget {
   final int surahId;
   const SurahScreen({super.key, required this.surahId});
@@ -24,27 +45,43 @@ class SurahScreen extends ConsumerStatefulWidget {
 
 class _SurahScreenState extends ConsumerState<SurahScreen> {
   final ScrollController _scrollController = ScrollController();
-  final Map<int, GlobalKey> _verseKeys = {};
   final AudioPlayer _player = AudioPlayer();
 
-  // playlist index → (surahId, verseNumber)
+  // Flat item list for the continuous Quran book view
+  final List<_Item> _items = [];
+  // (surahId, verse) → index in _items
+  final Map<(int, int), int> _verseIdx = {};
+  // surahId → index of its header in _items
+  final Map<int, int> _surahIdx = {};
+  // item index → GlobalKey (created lazily in itemBuilder)
+  final Map<int, GlobalKey> _keys = {};
+
+  // Audio playlist index → (surahId, verse)
   final List<(int, int)> _indexMap = [];
 
-  int _displaySurah = 1;
-  int _displayVerse = 1;
+  int _activeSurah = 1;
+  int _activeVerse = 1;
   bool _isPlaying = false;
   bool _isLoading = false;
+
+  // Auto-scroll: paused when user manually scrolls, resumes after 4 s
+  bool _autoScroll = true;
+  Timer? _scrollResumeTimer;
 
   @override
   void initState() {
     super.initState();
-    _displaySurah = widget.surahId;
+    _activeSurah = widget.surahId;
+    _buildItems();
 
     _player.currentIndexStream.listen((idx) {
       if (!mounted || idx == null || idx >= _indexMap.length) return;
-      final (_, verse) = _indexMap[idx];
-      setState(() => _displayVerse = verse);
-      _scrollToVerse(verse);
+      final (surah, verse) = _indexMap[idx];
+      setState(() {
+        _activeSurah = surah;
+        _activeVerse = verse;
+      });
+      _scrollToActive();
     });
 
     _player.playingStream.listen((p) {
@@ -54,19 +91,8 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     _player.processingStateStream.listen((s) {
       if (!mounted) return;
       if (s == ProcessingState.completed) {
-        if (_displaySurah < 114) {
-          final nextSurah = _displaySurah + 1;
-          setState(() {
-            _displaySurah = nextSurah;
-            _displayVerse = 1;
-            _verseKeys.clear();
-          });
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (_scrollController.hasClients) {
-              _scrollController.jumpTo(0);
-            }
-          });
-          _loadAndPlay(fromSurah: nextSurah);
+        if (_activeSurah < 114) {
+          _loadAndPlay(fromSurah: _activeSurah + 1);
         } else {
           setState(() => _isPlaying = false);
         }
@@ -78,13 +104,40 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
 
   @override
   void dispose() {
+    _scrollResumeTimer?.cancel();
     _player.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  // ─── build full-Quran playlist from starting surah ───
+  // ─── Build the continuous item list ──────────────────────────────
+  void _buildItems() {
+    _items.clear();
+    _verseIdx.clear();
+    _surahIdx.clear();
+    int prevJuz = -1;
 
+    for (int s = widget.surahId; s <= 114; s++) {
+      _surahIdx[s] = _items.length;
+      _items.add(_SurahHeaderItem(s));
+
+      final count = quran.getVerseCount(s);
+      for (int v = 1; v <= count; v++) {
+        final juz = quran.getJuzNumber(s, v);
+        if (juz != prevJuz) {
+          // Don't show juz marker at the very first verse
+          if (!(s == widget.surahId && v == 1)) {
+            _items.add(_JuzItem(juz));
+          }
+          prevJuz = juz;
+        }
+        _verseIdx[(s, v)] = _items.length;
+        _items.add(_VerseItem(s, v));
+      }
+    }
+  }
+
+  // ─── Audio ───────────────────────────────────────────────────────
   int _globalAyah(int surah, int verse) => _cumulative[surah - 1] + verse;
 
   Future<void> _loadAndPlay({int? fromSurah}) async {
@@ -99,25 +152,21 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
 
     for (int v = 1; v <= count; v++) {
       _indexMap.add((surahToPlay, v));
-      sources.add(AudioSource.uri(
-        Uri.parse(
-            '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(surahToPlay, v)}.mp3'),
-      ));
+      sources.add(AudioSource.uri(Uri.parse(
+        '${AppConstants.audioBaseUrl}/$reciter/${_globalAyah(surahToPlay, v)}.mp3',
+      )));
     }
 
     try {
       await _player.setAudioSource(
-        ConcatenatingAudioSource(
-          useLazyPreparation: true,
-          children: sources,
-        ),
+        ConcatenatingAudioSource(useLazyPreparation: true, children: sources),
         initialIndex: 0,
         initialPosition: Duration.zero,
       );
       setState(() {
         _isLoading = false;
-        _displaySurah = surahToPlay;
-        _displayVerse = 1;
+        _activeSurah = surahToPlay;
+        _activeVerse = 1;
       });
       await _player.play();
     } catch (e) {
@@ -126,16 +175,31 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     }
   }
 
-  void _scrollToVerse(int verse) {
-    final key = _verseKeys[verse];
+  // ─── Scroll ──────────────────────────────────────────────────────
+  void _scrollToActive() {
+    if (!_autoScroll) return;
+    final i = _verseIdx[(_activeSurah, _activeVerse)];
+    if (i == null) return;
+    final key = _keys[i];
     if (key?.currentContext != null) {
-      Scrollable.ensureVisible(key!.currentContext!,
-          duration: const Duration(milliseconds: 500),
-          curve: Curves.easeInOut,
-          alignment: 0.3);
+      Scrollable.ensureVisible(
+        key!.currentContext!,
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeInOut,
+        alignment: 0.3,
+      );
     }
   }
 
+  void _onUserScrollStart() {
+    _autoScroll = false;
+    _scrollResumeTimer?.cancel();
+    _scrollResumeTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _autoScroll = true);
+    });
+  }
+
+  // ─── Controls ────────────────────────────────────────────────────
   Future<void> _togglePlayPause() async {
     if (_isPlaying) {
       await _player.pause();
@@ -155,36 +219,49 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
     if (_player.hasNext) await _player.seekToNext();
   }
 
-  // Jump to a specific surah from the index list
   Future<void> _jumpToSurah(int surahId) async {
     await _player.stop();
     setState(() {
-      _displaySurah = surahId;
-      _displayVerse = 1;
-      _verseKeys.clear();
+      _activeSurah = surahId;
+      _activeVerse = 1;
+      _autoScroll = true;
     });
+    // Scroll to surah header in the continuous list
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) _scrollController.jumpTo(0);
+      final i = _surahIdx[surahId];
+      if (i == null) return;
+      final key = _keys[i];
+      if (key?.currentContext != null) {
+        Scrollable.ensureVisible(
+          key!.currentContext!,
+          duration: const Duration(milliseconds: 400),
+          curve: Curves.easeOut,
+        );
+      }
     });
     await _loadAndPlay(fromSurah: surahId);
   }
 
-  // Jump to a specific verse in current surah
-  Future<void> _jumpToVerse(int verse) async {
-    final idx = _indexMap.indexWhere(
-        (e) => e.$1 == _displaySurah && e.$2 == verse);
-    if (idx >= 0) {
-      await _player.seek(Duration.zero, index: idx);
-      if (!_isPlaying) await _player.play();
+  Future<void> _jumpToVerse(int surah, int verse) async {
+    if (surah != _activeSurah) {
+      await _player.stop();
+      await _loadAndPlay(fromSurah: surah);
+    } else {
+      final idx = _indexMap.indexWhere((e) => e.$1 == surah && e.$2 == verse);
+      if (idx >= 0) {
+        await _player.seek(Duration.zero, index: idx);
+        if (!_isPlaying) await _player.play();
+      }
     }
   }
 
+  // ─── Build ───────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     final reciter = ref.watch(_selectedReciterProvider);
-    final verseCount = quran.getVerseCount(_displaySurah);
-    final surahName = quran.getSurahName(_displaySurah);
-    final surahNameEn = quran.getSurahNameEnglish(_displaySurah);
+    final surahName = quran.getSurahName(_activeSurah);
+    final surahNameEn = quran.getSurahNameEnglish(_activeSurah);
+    final verseCount = quran.getVerseCount(_activeSurah);
 
     return Scaffold(
       appBar: AppBar(
@@ -193,38 +270,35 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
           children: [
             Text(surahName,
                 style: const TextStyle(fontFamily: 'Amiri', fontSize: 22)),
-            Text('$surahNameEn  •  سورة $_displaySurah',
+            Text('$surahNameEn  •  سورة $_activeSurah',
                 style: const TextStyle(
                     fontSize: 11, color: AppTheme.textSecondary)),
           ],
         ),
         actions: [
-          // Surah picker
           IconButton(
             icon: const Icon(Icons.format_list_numbered_rounded),
             tooltip: 'انتقل إلى سورة',
             onPressed: () async {
               final picked = await showDialog<int>(
                 context: context,
-                builder: (_) => _SurahPickerDialog(currentSurah: _displaySurah),
+                builder: (_) => _SurahPickerDialog(currentSurah: _activeSurah),
               );
               if (picked != null) await _jumpToSurah(picked);
             },
           ),
-          // Reciter picker
           PopupMenuButton<String>(
             icon: const Icon(Icons.mic_rounded),
             tooltip: 'اختر القارئ',
             initialValue: reciter,
-            constraints: const BoxConstraints(maxHeight: 420),
+            constraints: const BoxConstraints(maxHeight: 440),
             onSelected: (v) async {
               ref.read(_selectedReciterProvider.notifier).state = v;
               await _player.stop();
               setState(() {
-                _displaySurah = widget.surahId;
-                _displayVerse = 1;
+                _activeSurah = widget.surahId;
+                _activeVerse = 1;
                 _isPlaying = false;
-                _verseKeys.clear();
               });
               await _loadAndPlay();
             },
@@ -251,7 +325,7 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
                                 AppConstants.recitersFr[e.key] ?? '',
                                 style: TextStyle(
                                     fontSize: 11,
-                                    color: Colors.white.withOpacity(0.5)),
+                                    color: Colors.white.withValues(alpha: 0.5)),
                               ),
                             ],
                           ),
@@ -264,16 +338,17 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
       ),
       body: Column(
         children: [
-          // Reciter bar
+          // Current reciter + verse indicator
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
             color: AppTheme.surface,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(
-                  'الآية $_displayVerse / $verseCount',
+                  'الآية $_activeVerse / $verseCount',
                   style: const TextStyle(
                       fontSize: 12, color: AppTheme.textSecondary),
                 ),
@@ -290,7 +365,7 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
                       Text(AppConstants.recitersFr[reciter] ?? '',
                           style: TextStyle(
                               fontSize: 10,
-                              color: Colors.white.withOpacity(0.45))),
+                              color: Colors.white.withValues(alpha: 0.45))),
                     ],
                   ),
                   const SizedBox(width: 6),
@@ -301,50 +376,68 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
             ),
           ),
 
-          // Content
+          // Continuous Quran book
           Expanded(
-            child: _isLoading
-                ? const Center(
-                    child:
-                        CircularProgressIndicator(color: AppTheme.gold))
-                : ListView.builder(
-                    key: ValueKey(_displaySurah),
-                    controller: _scrollController,
-                    padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                    itemCount: verseCount + 1,
-                    itemBuilder: (context, index) {
-                      if (index == 0) {
-                        return _SurahHeader(
-                          surahId: _displaySurah,
-                          surahName: surahName,
-                        );
-                      }
-                      final verseNum = index;
-                      _verseKeys[verseNum] ??= GlobalKey();
-                      final isActive = _displayVerse == verseNum;
-                      final verseText = quran.getVerse(
-                          _displaySurah, verseNum,
-                          verseEndSymbol: true);
+            child: NotificationListener<ScrollNotification>(
+              onNotification: (n) {
+                if (n is ScrollStartNotification &&
+                    n.dragDetails != null) {
+                  _onUserScrollStart();
+                }
+                return false;
+              },
+              child: ListView.builder(
+                controller: _scrollController,
+                padding:
+                    const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                itemCount: _items.length,
+                itemBuilder: (context, i) {
+                  final item = _items[i];
 
-                      return _VerseCard(
-                        key: _verseKeys[verseNum],
-                        verseNumber: verseNum,
-                        verseText: verseText,
-                        isActive: isActive,
-                        isPlaying: isActive && _isPlaying,
-                        onTap: () => _jumpToVerse(verseNum),
-                      );
-                    },
-                  ),
+                  if (item is _SurahHeaderItem) {
+                    final key = _keys[i] ??= GlobalKey();
+                    return _SurahHeader(
+                      key: key,
+                      surahId: item.surahId,
+                      surahName: quran.getSurahName(item.surahId),
+                    );
+                  }
+
+                  if (item is _JuzItem) {
+                    return _JuzDivider(juzNum: item.juzNum);
+                  }
+
+                  if (item is _VerseItem) {
+                    final key = _keys[i] ??= GlobalKey();
+                    final isActive = item.surahId == _activeSurah &&
+                        item.verse == _activeVerse;
+                    return _VerseCard(
+                      key: key,
+                      verseNumber: item.verse,
+                      verseText: quran.getVerse(
+                          item.surahId, item.verse,
+                          verseEndSymbol: true),
+                      isActive: isActive,
+                      isPlaying: isActive && _isPlaying,
+                      onTap: () =>
+                          _jumpToVerse(item.surahId, item.verse),
+                    );
+                  }
+
+                  return const SizedBox.shrink();
+                },
+              ),
+            ),
           ),
 
           // Player bar
           _PlayerBar(
             surahName: surahName,
-            verseNumber: _displayVerse,
+            verseNumber: _activeVerse,
             totalVerses: verseCount,
-            surahNumber: _displaySurah,
+            surahNumber: _activeSurah,
             isPlaying: _isPlaying,
+            isLoading: _isLoading,
             onPlayPause: _togglePlayPause,
             onPrev: _prevVerse,
             onNext: _nextVerse,
@@ -355,8 +448,7 @@ class _SurahScreenState extends ConsumerState<SurahScreen> {
   }
 }
 
-// ──────────────────────── Surah Picker Dialog ────────────────────────
-
+// ─── Surah Picker Dialog ─────────────────────────────────────────────
 class _SurahPickerDialog extends StatelessWidget {
   final int currentSurah;
   const _SurahPickerDialog({required this.currentSurah});
@@ -365,7 +457,8 @@ class _SurahPickerDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     return Dialog(
       backgroundColor: AppTheme.surface,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      shape:
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: SizedBox(
         height: 500,
         child: Column(
@@ -388,7 +481,7 @@ class _SurahPickerDialog extends StatelessWidget {
                   return ListTile(
                     onTap: () => Navigator.pop(context, s),
                     tileColor: isSelected
-                        ? AppTheme.primary.withOpacity(0.2)
+                        ? AppTheme.primary.withValues(alpha: 0.2)
                         : null,
                     leading: Container(
                       width: 34,
@@ -418,8 +511,7 @@ class _SurahPickerDialog extends StatelessWidget {
                             color: isSelected
                                 ? AppTheme.gold
                                 : AppTheme.textPrimary)),
-                    subtitle: Text(
-                        '${quran.getVerseCount(s)} آية',
+                    subtitle: Text('${quran.getVerseCount(s)} آية',
                         style: const TextStyle(
                             fontSize: 11,
                             color: AppTheme.textSecondary)),
@@ -438,21 +530,21 @@ class _SurahPickerDialog extends StatelessWidget {
   }
 }
 
-// ──────────────────────────── Surah header ────────────────────────────
-
+// ─── Surah header ────────────────────────────────────────────────────
 class _SurahHeader extends StatelessWidget {
   final int surahId;
   final String surahName;
-  const _SurahHeader({required this.surahId, required this.surahName});
+  const _SurahHeader(
+      {super.key, required this.surahId, required this.surahName});
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // Surah name banner
         Container(
-          margin: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
+          margin: const EdgeInsets.fromLTRB(12, 16, 12, 6),
+          padding:
+              const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
           decoration: BoxDecoration(
             gradient: const LinearGradient(
               colors: [Color(0xFF1B5E20), Color(0xFF2E7D32)],
@@ -462,7 +554,7 @@ class _SurahHeader extends StatelessWidget {
             borderRadius: BorderRadius.circular(14),
             boxShadow: [
               BoxShadow(
-                  color: AppTheme.primary.withOpacity(0.4),
+                  color: AppTheme.primary.withValues(alpha: 0.4),
                   blurRadius: 10,
                   offset: const Offset(0, 4))
             ],
@@ -477,11 +569,10 @@ class _SurahHeader extends StatelessWidget {
                 textDirection: TextDirection.rtl),
           ),
         ),
-        // Bismillah (except Al-Fatiha and At-Tawbah)
         if (surahId != 1 && surahId != 9)
           Container(
-            margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            padding: const EdgeInsets.symmetric(vertical: 12),
+            margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+            padding: const EdgeInsets.symmetric(vertical: 10),
             decoration: BoxDecoration(
               color: AppTheme.surfaceCard,
               borderRadius: BorderRadius.circular(10),
@@ -502,14 +593,57 @@ class _SurahHeader extends StatelessWidget {
   }
 }
 
-// ──────────────────────────── Player bar ────────────────────────────
+// ─── Juz divider ─────────────────────────────────────────────────────
+class _JuzDivider extends StatelessWidget {
+  final int juzNum;
+  const _JuzDivider({required this.juzNum});
 
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(
+              child: Divider(
+                  color: AppTheme.gold.withValues(alpha: 0.4),
+                  thickness: 1)),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 12),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+            decoration: BoxDecoration(
+              color: AppTheme.gold.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                  color: AppTheme.gold.withValues(alpha: 0.4)),
+            ),
+            child: Text(
+              'الجزء $juzNum',
+              style: const TextStyle(
+                  fontFamily: 'Amiri',
+                  fontSize: 14,
+                  color: AppTheme.gold),
+            ),
+          ),
+          Expanded(
+              child: Divider(
+                  color: AppTheme.gold.withValues(alpha: 0.4),
+                  thickness: 1)),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Player bar ──────────────────────────────────────────────────────
 class _PlayerBar extends StatelessWidget {
   final String surahName;
   final int verseNumber;
   final int totalVerses;
   final int surahNumber;
   final bool isPlaying;
+  final bool isLoading;
   final VoidCallback onPlayPause;
   final VoidCallback onPrev;
   final VoidCallback onNext;
@@ -520,6 +654,7 @@ class _PlayerBar extends StatelessWidget {
     required this.totalVerses,
     required this.surahNumber,
     required this.isPlaying,
+    required this.isLoading,
     required this.onPlayPause,
     required this.onPrev,
     required this.onNext,
@@ -535,10 +670,11 @@ class _PlayerBar extends StatelessWidget {
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        border: const Border(top: BorderSide(color: AppTheme.gold, width: 1)),
+        border:
+            const Border(top: BorderSide(color: AppTheme.gold, width: 1)),
         boxShadow: [
           BoxShadow(
-              color: Colors.black.withOpacity(0.5),
+              color: Colors.black.withValues(alpha: 0.5),
               blurRadius: 16,
               offset: const Offset(0, -4)),
         ],
@@ -557,9 +693,11 @@ class _PlayerBar extends StatelessWidget {
                         color: AppTheme.gold,
                         fontWeight: FontWeight.bold),
                     textDirection: TextDirection.rtl),
-                Text('الآية $verseNumber / $totalVerses  •  س$surahNumber',
+                Text(
+                    'الآية $verseNumber / $totalVerses  •  س$surahNumber',
                     style: const TextStyle(
-                        fontSize: 11, color: AppTheme.textSecondary),
+                        fontSize: 11,
+                        color: AppTheme.textSecondary),
                     textDirection: TextDirection.rtl),
               ],
             ),
@@ -582,13 +720,19 @@ class _PlayerBar extends StatelessWidget {
                   height: 50,
                   decoration: const BoxDecoration(
                       color: AppTheme.gold, shape: BoxShape.circle),
-                  child: Icon(
-                    isPlaying
-                        ? Icons.pause_rounded
-                        : Icons.play_arrow_rounded,
-                    color: Colors.black,
-                    size: 30,
-                  ),
+                  child: isLoading
+                      ? const Padding(
+                          padding: EdgeInsets.all(12),
+                          child: CircularProgressIndicator(
+                              color: Colors.black, strokeWidth: 2),
+                        )
+                      : Icon(
+                          isPlaying
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          color: Colors.black,
+                          size: 30,
+                        ),
                 ),
               ),
               const SizedBox(width: 12),
@@ -607,8 +751,7 @@ class _PlayerBar extends StatelessWidget {
   }
 }
 
-// ──────────────────────────── Verse card ────────────────────────────
-
+// ─── Verse card ──────────────────────────────────────────────────────
 class _VerseCard extends StatelessWidget {
   final int verseNumber;
   final String verseText;
@@ -631,21 +774,22 @@ class _VerseCard extends StatelessWidget {
       onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 400),
-        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+        margin: const EdgeInsets.symmetric(vertical: 3, horizontal: 4),
         decoration: BoxDecoration(
           color: isActive
-              ? AppTheme.primary.withOpacity(0.18)
+              ? AppTheme.primary.withValues(alpha: 0.18)
               : AppTheme.surfaceCard,
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
-            color:
-                isActive ? AppTheme.gold : Colors.white.withOpacity(0.06),
+            color: isActive
+                ? AppTheme.gold
+                : Colors.white.withValues(alpha: 0.06),
             width: isActive ? 1.8 : 1,
           ),
           boxShadow: isActive
               ? [
                   BoxShadow(
-                      color: AppTheme.gold.withOpacity(0.15),
+                      color: AppTheme.gold.withValues(alpha: 0.15),
                       blurRadius: 14,
                       spreadRadius: 1)
                 ]
@@ -668,7 +812,7 @@ class _VerseCard extends StatelessWidget {
                             isActive ? AppTheme.gold : AppTheme.primary,
                         width: 1.5),
                     color: isActive
-                        ? AppTheme.gold.withOpacity(0.15)
+                        ? AppTheme.gold.withValues(alpha: 0.15)
                         : Colors.transparent,
                   ),
                   child: Center(
@@ -689,9 +833,11 @@ class _VerseCard extends StatelessWidget {
                   fontFamily: 'Amiri',
                   fontSize: isActive ? 25 : 22,
                   height: 2.1,
-                  color: isActive ? Colors.white : AppTheme.textPrimary,
-                  fontWeight:
-                      isActive ? FontWeight.bold : FontWeight.normal,
+                  color:
+                      isActive ? Colors.white : AppTheme.textPrimary,
+                  fontWeight: isActive
+                      ? FontWeight.bold
+                      : FontWeight.normal,
                 ),
                 child: Text(verseText,
                     textDirection: TextDirection.rtl,
@@ -725,7 +871,8 @@ class _PlayingDotsState extends State<_PlayingDots>
   void initState() {
     super.initState();
     _ctrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 900))
+        vsync: this,
+        duration: const Duration(milliseconds: 900))
       ..repeat();
   }
 
@@ -749,7 +896,7 @@ class _PlayingDotsState extends State<_PlayingDots>
             width: 6 * scale,
             height: 6 * scale,
             decoration: BoxDecoration(
-                color: AppTheme.gold.withOpacity(0.7 + 0.3 * scale),
+                color: AppTheme.gold.withValues(alpha: 0.7 + 0.3 * scale),
                 shape: BoxShape.circle),
           );
         }),
