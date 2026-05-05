@@ -1,0 +1,70 @@
+name: lawhi
+description: "لوحي - تطبيق إسلامي شامل"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # State management
+  flutter_riverpod: ^2.6.1
+  riverpod_annotation: ^2.6.1
+
+  # Supabase backend
+  supabase_flutter: ^2.9.1
+
+  # Audio
+  just_audio: ^0.9.43
+  audio_session: ^0.1.21
+
+  # Navigation
+  go_router: ^15.1.2
+
+  # Local storage
+  hive_flutter: ^1.1.0
+  shared_preferences: ^2.5.3
+
+  # Qibla & location
+  flutter_qiblah: ^3.2.0
+  geolocator: ^14.0.1
+  permission_handler: ^11.4.0
+
+  # Quran data
+  quran: any
+
+  # UI
+  google_fonts: ^6.2.1
+  flutter_svg: ^2.0.17
+  cached_network_image: ^3.4.1
+  shimmer: ^3.0.0
+
+  # Utils
+  intl: ^0.20.2
+  connectivity_plus: ^6.1.4
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  build_runner: ^2.4.14
+  riverpod_generator: ^2.6.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/quran/
+    - assets/images/
+    - assets/images/lawhi.jpeg
+    - assets/icons/
+  fonts:
+    - family: Amiri
+      fonts:
+        - asset: assets/fonts/Amiri-Regular.ttf
+        - asset: assets/fonts/Amiri-Bold.ttf
+          weight: 700
